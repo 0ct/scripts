@@ -59,9 +59,8 @@ validate_params() {
 detect_os() {
     # 添加更详细的版本检测
     if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS=$ID
-        VERSION_ID=${VERSION_ID%%.*}
+        OS=$(awk -F= '/^NAME/{print $2}' /etc/os-release | tr -d '"' | tr -d "'" | tr '[:upper:]' '[:lower:]' | awk '{print $1}')
+        VERSION=$(lsb_release -r | awk '{print $2}')
     elif [ -f /etc/redhat-release ]; then
         OS="centos"
         VERSION=$(cat /etc/redhat-release | sed -r 's/.* ([0-9]+)\..*/\1/')
@@ -87,6 +86,7 @@ detect_os() {
             fi
             ;;
         ubuntu)
+            
             if [[ ! "$VERSION" =~ ^(20\.04|22\.04|24\.04)$ ]]; then
                 log_message "Warning: Only Ubuntu 20.04/22.04/24.04 are fully supported"
             fi
