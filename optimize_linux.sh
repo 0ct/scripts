@@ -159,6 +159,9 @@ configure_sysctl_and_tcp() {
     local max_mem=$((1024 * 1024 * 1024)) # 1TB
     if ! validate_params "$MEM_TOTAL" "$min_mem" "$max_mem" "memory_size"; then
         MEM_TOTAL=$((16 * 1024 * 1024)) # 默认16GB
+        MIN_MEM=$((TOTAL_MEM / 4))
+        DEFAULT_MEM=$((TOTAL_MEM * 3 / 4))
+        MAX_MEM=$((TOTAL_MEM * 7 / 8))
     fi
 
     # 添加错误处理
@@ -230,12 +233,14 @@ configure_sysctl_and_tcp() {
         ["net.ipv4.tcp_ecn"]="0"
         ["net.ipv4.tcp_frto"]="0"
         ["net.ipv4.tcp_mtu_probing"]="0"
-        ["net.ipv4.tcp_rfc1337"]="0"
+        ["net.ipv4.tcp_rfc1337"]="1"
         ["net.ipv4.tcp_sack"]="1"
         ["net.ipv4.tcp_fack"]="1"
         ["net.ipv4.tcp_window_scaling"]="1"
         ["net.core.default_qdisc"]="fq"
         ["net.ipv4.tcp_congestion_control"]="bbr"
+        ["net.core.rmem_default"]="8388608"
+        ["net.core.wmem_default"]="8388608"
         ["net.core.rmem_max"]="$(
             if [ "$CPU_CORES" -ge 48 ] && [ "$MEM_TOTAL" -ge 67108864 ]; then
             echo "134217728"  # 128MB
@@ -272,12 +277,60 @@ configure_sysctl_and_tcp() {
             echo "4096 16384 33554432"
             fi
         )"
+        ["net.ipv4.tcp_mem"]="$(
+            if [ "$MEM_TOTAL" -ge 67108864 ]; then # >= 64GB
+                echo "8388608 12582912 16777216"
+            elif [ "$MEM_TOTAL" -ge 33554432 ]; then # >= 32GB
+                echo "4194304 6291456 8388608"
+            elif [ "$MEM_TOTAL" -ge 16777216 ]; then # >= 16GB
+                echo "1048576 4194304 6291456"
+            else
+                echo "786432 1048576 1572864" # 默认值
+            fi
+        )"
         ["net.ipv4.ip_forward"]="1"
         ["net.ipv4.conf.all.forwarding"]="1"
         ["net.ipv4.conf.default.forwarding"]="1"
+        ["net.ipv4.conf.default.rp_filter"]="1"
+        ["net.ipv4.conf.default.accept_source_route"]="0"
+        ["kernel.core_uses_pid"]="1"
+        ["kernel.msgmnb"]="65536"
+        ["kernel.msgmax"]="65536"
+        ["net.ipv4.icmp_echo_ignore_broadcasts"]="1"
+        ["net.ipv4.tcp_max_tw_buckets"]="262144"
+        ["net.ipv4.tcp_timestamps"]="1"
+        ["net.ipv4.tcp_slow_start_after_idle"]="0"
+        ["net.ipv4.tcp_early_retrans"]="1"
+        ["net.ipv4.tcp_recovery"]="1"
+        ["net.ipv4.tcp_retries2"]="8"
+        ["net.ipv4.tcp_synack_retries"]="3"
+        ["net.ipv4.tcp_syn_retries"]="3"
+        ["kernel.panic"]="10"
+        ["kernel.panic_on_oops"]="1"
+        ["vm.swappiness"]="10"
+        # NUMA 系统优化参数
+        ["vm.zone_reclaim_mode"]="0"
+        ["kernel.numa_balancing"]="0"
+        ["vm.numa_stat"]="0"
+        ["vm.numa_zonelist_order"]="Node"
+        
+        # IO相关优化参数
+        ["vm.dirty_background_bytes"]="67108864"
+        ["vm.dirty_bytes"]="134217728"
+        ["vm.page-cluster"]="0"
+        ["vm.dirty_expire_centisecs"]="3000"
+        ["vm.dirty_writeback_centisecs"]="1000"
+        
+        # 容器环境优化参数
+        ["kernel.keys.root_maxkeys"]="1000000"
+        ["kernel.keys.maxkeys"]="1000000"
+        ["fs.inotify.max_user_instances"]="8192"
+        ["fs.inotify.max_user_watches"]="524288"
+        ["kernel.pid_max"]="4194304"
     )
 
     # 根据 CPU 核心数和内存大小调整参数
+    # Adjust network parameters based on CPU cores and memory
     if [ "$CPU_CORES" -le 24 ]; then
         params["net.core.somaxconn"]="8192"
         params["net.core.netdev_max_backlog"]="32768"
@@ -286,7 +339,7 @@ configure_sysctl_and_tcp() {
         params["net.core.netdev_max_backlog"]="65536"
     elif [ "$CPU_CORES" -le 39 ]; then
         params["net.core.somaxconn"]="32768"
-        params["net.core.netdev_max_backlog"]="131072"
+        params["net.core.netdev_max_backlog"]="131072" 
     elif [ "$CPU_CORES" -le 47 ]; then
         params["net.core.somaxconn"]="65536"
         params["net.core.netdev_max_backlog"]="262144"
@@ -296,6 +349,15 @@ configure_sysctl_and_tcp() {
     else
         params["net.core.somaxconn"]="262144"
         params["net.core.netdev_max_backlog"]="1048576"
+    fi
+
+    # Adjust tcp_max_tw_buckets based on memory size
+    if [ "$MEM_TOTAL" -ge 33554432 ]; then # >= 32GB
+        params["net.ipv4.tcp_max_tw_buckets"]="1048576"
+    elif [ "$MEM_TOTAL" -ge 16777216 ]; then # >= 16GB
+        params["net.ipv4.tcp_max_tw_buckets"]="524288"
+    elif [ "$MEM_TOTAL" -ge 8388608 ]; then # >= 8GB
+        params["net.ipv4.tcp_max_tw_buckets"]="262144"
     fi
 
     # 清理旧配置并写入新配置
@@ -517,6 +579,129 @@ rollback_changes() {
     log_message "System configuration rolled back to previous state"
 }
 
+# NUMA系统优化
+optimize_numa() {
+    if [ -d "/sys/devices/system/node" ] && [ $(ls -d /sys/devices/system/node/node* 2>/dev/null | wc -l) -gt 1 ]; then
+        log_message "NUMA system detected, applying NUMA optimizations..."
+        
+        # 设置CPU亲和性
+        for pid in $(ps -eo pid,comm,psr | grep -E '(nginx|docker|containerd)' | awk '{print $1}'); do
+            if [ -d "/proc/$pid" ]; then
+                taskset -pc 0-$((CPU_CORES-1)) $pid >/dev/null 2>&1
+            fi
+        done
+
+        # 安装并配置numad
+        case $OS in
+            centos)
+                yum install -y numad numactl
+                ;;
+            debian|ubuntu)
+                apt-get install -y numad numactl
+                ;;
+        esac
+
+        systemctl enable numad
+        systemctl start numad
+
+        # 设置NUMA内存交错模式
+        if command -v numactl >/dev/null; then
+            echo "interleave=all" > /etc/numad.conf
+        fi
+    else
+        log_message "No NUMA system detected, skipping NUMA optimizations"
+    fi
+}
+
+# IO调度器优化
+optimize_io_scheduler() {
+    log_message "Configuring IO scheduler..."
+    
+    # 获取所有块设备
+    local devices=$(lsblk -d -o name | tail -n +2)
+    
+    for device in $devices; do
+        if [ -f "/sys/block/$device/queue/scheduler" ]; then
+            # 检查设备类型
+            if [[ $(cat /sys/block/$device/queue/rotational) -eq 0 ]]; then
+                # SSD设备使用none或mq-deadline
+                echo "none" > "/sys/block/$device/queue/scheduler" 2>/dev/null || \
+                echo "mq-deadline" > "/sys/block/$device/queue/scheduler"
+                
+                # 优化SSD参数
+                echo "0" > "/sys/block/$device/queue/add_random" 2>/dev/null
+                echo "256" > "/sys/block/$device/queue/nr_requests" 2>/dev/null
+            else
+                # HDD设备使用bfq
+                echo "bfq" > "/sys/block/$device/queue/scheduler"
+                
+                # 优化HDD参数
+                echo "128" > "/sys/block/$device/queue/nr_requests" 2>/dev/null
+                echo "1" > "/sys/block/$device/queue/add_random" 2>/dev/null
+            fi
+            
+            # 通用优化参数
+            echo "512" > "/sys/block/$device/queue/read_ahead_kb"
+            echo "2" > "/sys/block/$device/queue/rq_affinity"
+        fi
+    done
+}
+
+# 容器环境优化
+optimize_container_env() {
+    log_message "Applying container-specific optimizations..."
+    
+    # 检查是否为容器环境
+    if [ -f "/.dockerenv" ] || [ -f "/run/.containerenv" ] || systemctl status docker.service >/dev/null 2>&1; then
+        # 优化容器运行时参数
+        if systemctl status docker.service >/dev/null 2>&1; then
+            mkdir -p /etc/docker
+            cat > /etc/docker/daemon.json <<EOF
+{
+    "default-ulimits": {
+        "nofile": {
+            "Name": "nofile",
+            "Hard": 655360,
+            "Soft": 655360
+        }
+    },
+    "log-driver": "json-file",
+    "log-opts": {
+        "max-size": "100m",
+        "max-file": "3"
+    },
+    "max-concurrent-downloads": 10,
+    "max-concurrent-uploads": 10,
+    "storage-driver": "overlay2",
+    "storage-opts": ["overlay2.override_kernel_check=true"],
+    "exec-opts": ["native.cgroupdriver=systemd"],
+    "registry-mirrors": ["https://registry.docker-cn.com"],
+    "dns": ["8.8.8.8", "8.8.4.4"]
+}
+EOF
+            systemctl restart docker
+        fi
+
+        # 配置containerd（如果存在）
+        if command -v containerd >/dev/null; then
+            mkdir -p /etc/containerd
+            containerd config default > /etc/containerd/config.toml
+            sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+            systemctl restart containerd
+        fi
+
+        # 优化内核参数
+        cat >> /etc/sysctl.conf <<EOF
+# Container specific settings
+kernel.keys.root_maxkeys = 1000000
+kernel.keys.maxkeys = 1000000
+fs.inotify.max_user_instances = 8192
+fs.inotify.max_user_watches = 524288
+kernel.pid_max = 4194304
+EOF
+    fi
+}
+
 # Main run logic  
 main() {  
     log_message "Starting system optimization..."
@@ -539,6 +724,9 @@ main() {
     check_kernel_version
     optimize_network
     os_specific_config
+    optimize_numa
+    optimize_io_scheduler
+    optimize_container_env
     
     log_message "System optimization completed successfully!"
     log_message "System information summary:"
