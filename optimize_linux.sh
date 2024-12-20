@@ -517,26 +517,6 @@ os_specific_config() {
             if [ "$OS" = "ubuntu" ] && [[ "$VERSION" =~ ^(20\.04|22\.04|24\.04)$ ]]; then
                 # Ubuntu 特定优化
                 tuned-adm profile throughput-performance
-                
-                # 检查和配置 Netplan
-                if [ -d /etc/netplan ]; then
-                    local netplan_file="/etc/netplan/99-custom-net.yaml"
-                    if [ ! -f "$netplan_file" ]; then
-                        cat > "$netplan_file" <<EOF
-network:
-  version: 2
-  renderer: networkd
-  ethernets:
-    all:
-      match:
-        name: en*
-      optional: true
-      mtu: 9000
-EOF
-                        netplan apply
-                        log_message "Applied network optimizations via Netplan"
-                    fi
-                fi
             fi
             ;;
     esac
