@@ -6,7 +6,8 @@
 # 添加日志功能
 LOGFILE="/var/log/system_optimize.log"
 log_message() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOGFILE"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[${timestamp}] $1" | tee -a "$LOGFILE"
 }
 
 # 检查root权限
@@ -48,10 +49,16 @@ validate_params() {
     local max=$3
     local param_name=$4
 
-    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt "$min" ] || [ "$value" -gt "$max" ]; then
-        log_message "Warning: Invalid value for ${param_name}: ${value}. Using default value."
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        log_message "Warning: Invalid value for ${param_name}: ${value} (not a number). Using default value."
         return 1
     fi
+    
+    if [ "$value" -lt "$min" ] || [ "$value" -gt "$max" ]; then
+        log_message "Warning: Value for ${param_name}: ${value} out of range (${min}-${max}). Using default value."
+        return 1
+    fi
+    
     return 0
 }
 
@@ -59,8 +66,10 @@ validate_params() {
 detect_os() {
     # 添加更详细的版本检测
     if [ -f /etc/os-release ]; then
-        OS=$(awk -F= '/^NAME/{print $2}' /etc/os-release | tr -d '"' | tr -d "'" | tr '[:upper:]' '[:lower:]' | awk '{print $1}')
-        VERSION=$(lsb_release -r | awk '{print $2}')
+        # 使用 source 命令加载变量
+        source /etc/os-release
+        OS=$(echo "$NAME" | tr '[:upper:]' '[:lower:]' | awk '{print $1}')
+        VERSION="$VERSION_ID"
     elif [ -f /etc/redhat-release ]; then
         OS="centos"
         VERSION=$(cat /etc/redhat-release | sed -r 's/.* ([0-9]+)\..*/\1/')
@@ -72,6 +81,8 @@ detect_os() {
         exit 1
     fi
 
+    log_message "Detected OS: $OS $VERSION"
+
     # 验证支持的系统版本
     case $OS in
         centos)
@@ -80,14 +91,12 @@ detect_os() {
             fi
             ;;
         debian)
-            VERSION_NUM=$(echo "$VERSION" | grep -oE '^[0-9]+' || echo "0")
-            if ! [[ "$VERSION_NUM" =~ ^[0-9]+$ ]] || [ "$VERSION_NUM" -lt 11 ] || [ "$VERSION_NUM" -gt 12 ]; then
+            if ! [[ "$VERSION" =~ ^(11|12)$ ]]; then
                 log_message "Warning: Only Debian 11/12 are fully supported"
             fi
             ;;
         ubuntu)
-            
-            if [[ ! "$VERSION" =~ ^(20\.04|22\.04|24\.04)$ ]]; then
+            if ! [[ "$VERSION" =~ ^(20\.04|22\.04|24\.04)$ ]]; then
                 log_message "Warning: Only Ubuntu 20.04/22.04/24.04 are fully supported"
             fi
             ;;
@@ -122,21 +131,34 @@ check_kernel_features() {
     fi
 }
 
-# 根据内存计算共享内存参数 (shmmax and shmall)  
-calculate_shared_memory_params() {  
-    MEM_TOTAL=$(grep MemTotal /proc/meminfo | awk '{print $2}') # 单位为 kB  
-    SHMMAX=$((MEM_TOTAL * 1024 * 8 / 10)) # 80% 的内存大小，单位 bytes  
-    SHMALL=$((SHMMAX / 4096))             # 页大小为 4KB  
-}  
+# 在脚本开头定义内存相关变量
+get_memory_size() {
+    MEM_TOTAL=$(grep MemTotal /proc/meminfo | awk '{print $2}') # 单位为 kB
+    MEM_TOTAL_BYTES=$((MEM_TOTAL * 1024))  # 转换为bytes
+    
+    log_message "Detected memory: $MEM_TOTAL kB ($((MEM_TOTAL / 1024)) MB)"
+}
 
 # 获取 CPU 核心数
 get_cpu_cores() {
     CPU_CORES=$(nproc)
 }
 
-# 获取内存大小
-get_memory_size() {
-    MEM_TOTAL=$(grep MemTotal /proc/meminfo | awk '{print $2}') # 单位为 kB
+# 计算共享内存参数的函数
+calculate_shared_memory_params() {
+    # 确保使用统一的内存单位
+    local mem_kb=$MEM_TOTAL
+    
+    # 计算共享内存参数
+    SHMMAX=$((mem_kb * 1024 * 8 / 10))  # 内存的80%，单位为字节
+    local page_size=$(getconf PAGE_SIZE)
+    SHMALL=$((SHMMAX / page_size))
+    
+    # 验证值是否在合理范围内
+    if [ "$SHMMAX" -gt "$((128 * 1024 * 1024 * 1024))" ]; then
+        SHMMAX="$((128 * 1024 * 1024 * 1024))"
+        log_message "Warning: Adjusted SHMMAX to maximum recommended value"
+    fi
 }
 
 # 更新 sysctl.conf 文件
@@ -148,6 +170,18 @@ update_sysctl_conf() {
     done
 }
 
+# 检查命令执行状态
+check_command_status() {
+    local status=$1
+    local command_name=$2
+    
+    if [ $status -ne 0 ]; then
+        log_message "错误: 命令 '$command_name' 执行失败，状态码 $status"
+        return 1
+    fi
+    return 0
+}
+
 # 合并配置系统核心参数、TCP 优化和启用IP转发的函数
 configure_sysctl_and_tcp() {
     calculate_shared_memory_params
@@ -155,13 +189,11 @@ configure_sysctl_and_tcp() {
     get_memory_size
 
     # 验证内存参数
-    local min_mem=$((1024 * 1024)) # 1GB
-    local max_mem=$((1024 * 1024 * 1024)) # 1TB
-    if ! validate_params "$MEM_TOTAL" "$min_mem" "$max_mem" "memory_size"; then
-        MEM_TOTAL=$((16 * 1024 * 1024)) # 默认16GB
-        MIN_MEM=$((TOTAL_MEM / 4))
-        DEFAULT_MEM=$((TOTAL_MEM * 3 / 4))
-        MAX_MEM=$((TOTAL_MEM * 7 / 8))
+    local min_mem=1024 # 1GB in MB
+    local max_mem=$((1024 * 1024)) # 1TB in MB
+    if ! validate_params "$((MEM_TOTAL / 1024))" "$min_mem" "$max_mem" "memory_size"; then
+        MEM_TOTAL=$((16 * 1024 * 1024)) # 默认16GB in KB
+        log_message "使用默认内存大小: 16GB"
     fi
 
     # 添加错误处理
@@ -365,8 +397,14 @@ configure_sysctl_and_tcp() {
 
     # 应用配置并检查错误
     if ! sysctl -p; then
-        log_message "Error: Failed to apply sysctl settings"
+        log_message "错误: 无法应用 sysctl 设置"
         ((error_count++))
+        # 记录具体哪些参数应用失败
+        for key in "${!params[@]}"; do
+            if ! sysctl -q "$key"; then
+                log_message "参数 $key 应用失败"
+            fi
+        done
     fi
 
     if ! sysctl --system; then
@@ -595,25 +633,44 @@ optimize_numa() {
 
 # IO调度器优化
 optimize_io_scheduler() {
-    log_message "Configuring IO scheduler..."
+    log_message "配置 IO 调度器..."
     
     # 获取所有块设备
     local devices=$(lsblk -d -o name | tail -n +2)
     
     for device in $devices; do
         if [ -f "/sys/block/$device/queue/scheduler" ]; then
+            # 获取可用的调度器
+            local available_schedulers=$(cat "/sys/block/$device/queue/scheduler")
+            log_message "设备 $device 可用的调度器: $available_schedulers"
+            
             # 检查设备类型
             if [[ $(cat /sys/block/$device/queue/rotational) -eq 0 ]]; then
                 # SSD设备使用none或mq-deadline
-                echo "none" > "/sys/block/$device/queue/scheduler" 2>/dev/null || \
-                echo "mq-deadline" > "/sys/block/$device/queue/scheduler"
+                if [[ $available_schedulers == *"none"* ]]; then
+                    echo "none" > "/sys/block/$device/queue/scheduler"
+                    log_message "设备 $device (SSD) 使用 none 调度器"
+                elif [[ $available_schedulers == *"mq-deadline"* ]]; then
+                    echo "mq-deadline" > "/sys/block/$device/queue/scheduler"
+                    log_message "设备 $device (SSD) 使用 mq-deadline 调度器"
+                else
+                    log_message "警告: 设备 $device 没有合适的 SSD 调度器"
+                fi
                 
                 # 优化SSD参数
                 echo "0" > "/sys/block/$device/queue/add_random" 2>/dev/null
                 echo "256" > "/sys/block/$device/queue/nr_requests" 2>/dev/null
             else
-                # HDD设备使用bfq
-                echo "bfq" > "/sys/block/$device/queue/scheduler"
+                # HDD设备使用bfq或cfq
+                if [[ $available_schedulers == *"bfq"* ]]; then
+                    echo "bfq" > "/sys/block/$device/queue/scheduler"
+                    log_message "设备 $device (HDD) 使用 bfq 调度器"
+                elif [[ $available_schedulers == *"cfq"* ]]; then
+                    echo "cfq" > "/sys/block/$device/queue/scheduler"
+                    log_message "设备 $device (HDD) 使用 cfq 调度器"
+                else
+                    log_message "警告: 设备 $device 没有合适的 HDD 调度器"
+                fi
                 
                 # 优化HDD参数
                 echo "128" > "/sys/block/$device/queue/nr_requests" 2>/dev/null
@@ -687,10 +744,14 @@ main() {
     log_message "Starting system optimization..."
     check_root
     check_dependencies
+    
+    # 创建备份目录
+    local backup_timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_dir="/root/system_config_backup_${backup_timestamp}"
     backup_configs
     
     # 使用trap捕获错误
-    trap 'log_message "Error occurred. Rolling back changes..."; rollback_changes "/root/system_config_backup_$(date +%Y%m%d_%H%M%S)"; exit 1' ERR
+    trap 'log_message "Error occurred. Rolling back changes..."; rollback_changes "$backup_dir"; exit 1' ERR INT TERM
 
     detect_os
     check_kernel_features
@@ -708,13 +769,24 @@ main() {
     optimize_io_scheduler
     optimize_container_env
     
-    log_message "System optimization completed successfully!"
-    log_message "System information summary:"
-    log_message "OS: $OS $VERSION"
-    log_message "Kernel: $(uname -r)"
-    log_message "CPU cores: $(nproc)"
-    log_message "Memory: $(awk '/MemTotal/ {printf "%.1fGB", $2/1024/1024}' /proc/meminfo)"
-    log_message "Please restart the system to apply all changes."
+    log_message "系统优化成功完成!"
+    log_message "系统信息摘要:"
+    log_message "操作系统: $OS $VERSION"
+    log_message "内核版本: $(uname -r)"
+    log_message "CPU 核心数: $(nproc)"
+    log_message "内存: $(awk '/MemTotal/ {printf "%.1fGB", $2/1024/1024}' /proc/meminfo)"
+    log_message "请重启系统以应用所有更改。"
+    
+    # 询问用户是否立即重启
+    read -p "是否立即重启系统? (y/n): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        log_message "系统将在 10 秒后重启..."
+        sleep 10
+        reboot
+    else
+        log_message "请稍后手动重启系统以应用所有更改。"
+    fi
 }  
 
 main "$@"
